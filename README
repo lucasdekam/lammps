@@ -1,3 +1,114 @@
+======================================================================
+ THIS FORK: charge-conditioned GRACE models in pair_style grace
+======================================================================
+
+Branch `grace`, forked from yury-lysogorskiy/lammps.
+
+A charge-conditioned (FiLM) GRACE model takes a per-structure total charge as
+an input and exports the work function dE/dq alongside energy and forces. This
+fork wires both through `pair_style grace`, so constant-charge MD of a charged
+electrode/electrolyte interface can run in LAMMPS instead of through ASE.
+
+Everything here is optional and detected from the saved model's signature: a
+model with neither tensor is driven exactly as before.
+
+
+SETTING THE CHARGE
+----------------------------------------------------------------------
+
+  pair_style  grace q -0.5
+  pair_coeff  * * /path/to/saved_model O H Pt
+
+`q` is the total charge in e, negative for excess electrons, matching GPAW-SJM
+and the usual training-data convention. It may be combined with any of the
+existing keywords (`padding`, `pad_verbose`, `pair_forces`, ...).
+
+Giving `q` to a model whose compute signature has no `total_charge` input is an
+ERROR, not a warning. The charge would otherwise be ignored and every number
+downstream would be the q = 0 answer wearing a charge label.
+
+The charge is also mutable mid-run through `Pair::extract("total_charge")`,
+which is how a Python driver can ramp or step it without rebuilding.
+
+
+READING THE WORK FUNCTION
+----------------------------------------------------------------------
+
+dE/dq is published as the pair style's one global extra quantity (`pvector`),
+which is the standard LAMMPS mechanism for a scalar a pair style computes but
+that is not an energy. `compute pair` exposes it:
+
+  compute       wf all pair grace
+  thermo_style  custom step temp pe c_wf[1]
+
+It is then an ordinary thermo value, so `fix ave/time`, `dump`, `print` and
+variables all work on it. No separate output file is needed.
+
+It is also readable through `Pair::extract("work_function")` for a Python
+driver.
+
+Three things to know about the value:
+
+* `ComputePair` MPI_SUM-reduces `pvector` across ranks, so the pair style
+  contributes from rank 0 only. Without that a multi-rank run would report
+  nprocs times the work function -- and would look perfectly plausible when
+  tested on one rank.
+
+* It starts as NaN and stays NaN unless a charge-conditioned model actually
+  produces one, so reading it off an ordinary GRACE model is obvious rather
+  than a believable zero.
+
+* It is dE/dq of the PADDED system. Padded atoms map to structure 0, so FiLM
+  conditions them on the real charge and they contribute. Unlike the padded
+  energy this is NOT a constant offset, because the contribution is itself
+  charge dependent. Run with `padding 0` where the absolute dE/dq has to be
+  exact; the padding is a speed/recompilation trade-off, not a correctness one.
+
+
+BUILDING
+----------------------------------------------------------------------
+
+  bash configure.sh          # ON THE LOGIN NODE -- it downloads
+  sbatch srun_build.sh       # compile only
+
+The split is not cosmetic. CMake configure downloads three things for ML-PACE
+-- the PACE evaluator library, cppflow, and TensorFlow itself -- and compute
+nodes on many clusters have no outbound network.
+
+Two traps in the TensorFlow discovery, both of which cost a build here:
+
+* Do NOT pass `-DTF_LIB_FILE`. It takes a branch of `cmake/Modules/Packages/
+  ML-PACE.cmake` that sets the library but never `TF_INCLUDE_PATH`, so cppflow
+  cannot find `tensorflow/c/tf_tensor.h` and the compile dies about 2000
+  objects in. Only the Python-discovery branch sets both.
+
+* DO pass `-DPACE_PYTHON_EXEC=$(which python3)`. CMake's own
+  `find_program(python3)` picks the system or module python rather than the
+  active virtualenv, and if that interpreter has no tensorflow, discovery
+  returns nothing and CMake silently downloads TensorFlow and builds against
+  it -- a different TensorFlow from the one loaded at run time, with nothing
+  in the log to say so.
+
+`configure.sh` does both, and then verifies the library CMake found actually
+lives inside the virtualenv rather than trusting the message.
+
+Kokkos is deliberately not built. The Kokkos pair styles read a `.npz` exported
+by `grace_utils export_kokkos`, which rejects non-standard instruction graphs,
+and FiLM conditioning is one.
+
+
+VERIFYING
+----------------------------------------------------------------------
+
+`test_grace_q/` checks the charge reaches the model and the work function comes
+back out, against the ASE `TPCalculator` on the same structure. On a 108-atom
+Pt(111)/water frame both match to every digit printed at q = -0.5 and +0.5 e,
+and the two charges differ by 9.43 eV and 1.62 V. See its README.
+
+
+======================================================================
+
+
 This is the LAMMPS software package.
 
 LAMMPS stands for Large-scale Atomic/Molecular Massively Parallel
