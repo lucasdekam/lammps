@@ -107,6 +107,15 @@ class PairGRACE : public Pair {
   int flag_compute_atomic_sigma = 0;      // toggle settable via extract("atomic_sigma_flag")
   // HAL: f[i] += kappa * (||F_phys_i||+eps) / (||F_sigma_i||+eps) * F_sigma_i (per-atom, post-loop).
   double kappa = 0.0;                     // mutable via extract("kappa")
+
+  // Charge conditioning. A FiLM-conditioned model takes a per-structure
+  // `total_charge` input and exports `work_function` = dE/dq. Both are
+  // optional: a model without them is driven exactly as before.
+  double total_charge = 0.0;              // `pair_style grace q <e>`; mutable via extract("total_charge")
+  bool total_charge_given = false;        // `q` appeared in settings()
+  bool has_total_charge_input = false;    // the compute signature takes it
+  bool has_work_function_output = false;  // the compute signature exports it
+  double work_function = 0.0;             // last dE/dq in V, via extract("work_function")
   // If true, the kappa contribution is also tallied into the GLOBAL virial via a
   // post-loop F^kappa*r positional-virial sum over local atoms; per-atom stress is
   // not affected (the per-atom rescale has no per-bond Newton-3 decomposition).

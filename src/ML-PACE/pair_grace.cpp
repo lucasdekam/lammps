@@ -184,6 +184,14 @@ void PairGRACE::settings(int narg, char **arg)
       neigh_padding_fraction = utils::numeric(FLERR, arg[iarg + 1], false, lmp);
       iarg += 2;
 
+    } else if (strcmp(arg[iarg], "q") == 0) {
+      // Total charge fed to a charge-conditioned (FiLM) model, in e.
+      // Negative = excess electrons, matching GPAW-SJM and the training data.
+      if (iarg + 1 >= narg) utils::missing_cmd_args(FLERR, "pair_style grace q", error);
+      total_charge = utils::numeric(FLERR, arg[iarg + 1], false, lmp);
+      total_charge_given = true;
+      iarg += 2;
+
     } else if (strcmp(arg[iarg], "pad_verbose") == 0) {
       pad_verbose = true;
       iarg += 1;
@@ -420,6 +428,29 @@ void PairGRACE::coeff(int narg, char **arg)
   }
   graceimpl->compute_inputs_sig = graceimpl->model->signatures.at(compute_function_name).inputs;
 
+  // Charge conditioning is detected from the signature, not assumed: an
+  // ordinary GRACE model simply has neither tensor and runs unchanged.
+  has_total_charge_input = graceimpl->compute_inputs_sig.count("total_charge") > 0;
+  has_work_function_output =
+      graceimpl->model->signatures.at(compute_function_name).outputs.count("work_function") > 0;
+
+  // A `q` that the model cannot read would be silently ignored, and every
+  // number downstream would be the neutral-surface answer wearing a charge
+  // label. Refuse instead.
+  if (total_charge_given && !has_total_charge_input)
+    error->all(FLERR,
+               "[GRACE] pair_style grace q {:.6g} was given but this model's '{}' signature has "
+               "no 'total_charge' input. It is not charge-conditioned, so the charge would be "
+               "ignored and the results would silently be the q = 0 ones.",
+               total_charge, compute_function_name);
+
+  if (has_total_charge_input && comm->me == 0)
+    utils::logmesg(lmp, "[GRACE] charge-conditioned model: total_charge = {:.6g} e{}\n",
+                   total_charge,
+                   has_work_function_output ? ", work_function (dE/dq) available via "
+                                              "extract(\"work_function\")"
+                                            : "");
+
   // check for compute_energy_only function
   if (graceimpl->model->has_signature(COMPUTE_ENERGY_ONLY_KEY)) {
     compute_energy_only_function_name = COMPUTE_ENERGY_ONLY_KEY;
@@ -582,6 +613,9 @@ void *PairGRACE::extract(const char *str, int &dim)
   if (strcmp(str, "uncertainty_force_flag") == 0) return (void *) &flag_compute_uncertainty_force;
   if (strcmp(str, "atomic_sigma_flag") == 0) return (void *) &flag_compute_atomic_sigma;
   if (strcmp(str, "kappa") == 0) return (void *) &kappa;
+  // Charge conditioning: set the charge mid-run, read back dE/dq.
+  if (strcmp(str, "total_charge") == 0) return (void *) &total_charge;
+  if (strcmp(str, "work_function") == 0) return (void *) &work_function;
 
   dim = 2;
   if (strcmp(str, "scale") == 0) return (void *) scale;
@@ -1007,6 +1041,26 @@ void PairGRACE::compute(int eflag, int vflag)
   inputs.emplace_back(compute_inputs_sig.at("batch_tot_nat_real").name,
                       cppflow::tensor(std::vector<int32_t>{nlocal}, {}));
 
+  // total_charge: one row per structure, and LAMMPS is always one structure
+  // (map_atoms_to_structure above is all zeros). Padded atoms belong to that
+  // same structure, so they are conditioned on the real charge -- see the note
+  // in compute()'s work-function readout below.
+  if (compute_inputs_sig.count("total_charge")) {
+    const auto &tc_sig = compute_inputs_sig.at("total_charge");
+    if (tc_sig.dtype == TF_DOUBLE) {
+      inputs.emplace_back(tc_sig.name,
+                          cppflow::tensor(std::vector<double>{total_charge}, {1, 1}));
+    } else if (tc_sig.dtype == TF_FLOAT) {
+      inputs.emplace_back(
+          tc_sig.name, cppflow::tensor(std::vector<float>{(float) total_charge}, {1, 1}));
+    } else {
+      error->all(FLERR,
+                 "[GRACE] 'total_charge' input has dtype id {} (expected float32 = {} or "
+                 "float64 = {})",
+                 (int) tc_sig.dtype, (int) TF_FLOAT, (int) TF_DOUBLE);
+    }
+  }
+
   // ind_i, ind_j: bonds
   //determine the maximum number of neighbours (within cutoff)
   graceimpl->actual_jnum.resize(inum);
@@ -1232,6 +1286,7 @@ void PairGRACE::compute(int eflag, int vflag)
 
   vector<string> output_names;
   UQOutputIdx uq_idx;
+  int wf_out_idx = -1;    // slot of work_function in `output`, -1 if not requested
   if (do_energy_only) {
     //TODO: update!
     auto compute_outputs_sig =
@@ -1278,6 +1333,13 @@ void PairGRACE::compute(int eflag, int vflag)
     if (pair_forces)
       output_names.emplace_back(compute_outputs_sig.at("z_pair_f")
                                     .name);    //"StatefulPartitionedCall:4");// pair_f [n_bonds, 3]
+
+    // dE/dq, from the same backward pass that produced the forces. Appended
+    // last so the fixed [0..4] index layout above is untouched.
+    if (has_work_function_output) {
+      output_names.emplace_back(compute_outputs_sig.at("work_function").name);
+      wf_out_idx = static_cast<int>(output_names.size()) - 1;
+    }
   }
   data_timer.stop();
 
@@ -1290,6 +1352,16 @@ void PairGRACE::compute(int eflag, int vflag)
   auto &e_out = output[0];    // atomic_energy
   auto e_tens = e_out.get_tensor();
   const double *e_data = static_cast<const double *>(TF_TensorData(e_tens.get()));
+
+  // work_function = dE/dq for the one structure. Note this is dE/dq of the
+  // PADDED system: padded atoms map to structure 0, so FiLM conditions them on
+  // the real charge and they contribute. Their contribution is charge
+  // dependent, so unlike the padded energy it is not a constant offset --
+  // run with `padding 0` if the absolute dE/dq has to be exact.
+  if (wf_out_idx >= 0) {
+    auto wf_tens = output[wf_out_idx].get_tensor();
+    work_function = static_cast<const double *>(TF_TensorData(wf_tens.get()))[0];
+  }
 
   if (!do_energy_only) {
     //    auto &te_out = output[1]; // total_energy
