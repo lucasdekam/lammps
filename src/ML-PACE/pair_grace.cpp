@@ -21,6 +21,7 @@
 
 #include "yaml-cpp/yaml.h"
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <string>
 #include <unistd.h>
@@ -111,6 +112,15 @@ PairGRACE::PairGRACE(LAMMPS *lmp) : Pair(lmp)
 
   graceimpl = new GRACEImpl;
 
+  // One global extra quantity, the work function dE/dq, reachable from an
+  // input script as `compute <id> all pair grace` -> the compute's vector
+  // element 1. NaN until a charge-conditioned model actually produces one, so
+  // reading it off a model without a work_function output is obvious rather
+  // than a plausible-looking zero.
+  nextra = 1;
+  pvector = new double[nextra];
+  pvector[0] = std::numeric_limits<double>::quiet_NaN();
+
   scale = nullptr;
 
   chunksize = 4096;
@@ -138,6 +148,7 @@ PairGRACE::~PairGRACE()
                          {"Model", model_timer.as_microseconds()}});
 
   delete graceimpl;
+  delete[] pvector;
 
   if (allocated) {
     memory->destroy(setflag);
@@ -1361,6 +1372,9 @@ void PairGRACE::compute(int eflag, int vflag)
   if (wf_out_idx >= 0) {
     auto wf_tens = output[wf_out_idx].get_tensor();
     work_function = static_cast<const double *>(TF_TensorData(wf_tens.get()))[0];
+    // ComputePair MPI_SUM-reduces pvector across ranks, so exactly one rank
+    // may contribute or the reported value would be nprocs times too large.
+    pvector[0] = (comm->me == 0) ? work_function : 0.0;
   }
 
   if (!do_energy_only) {
