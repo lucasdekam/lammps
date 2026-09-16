@@ -50,7 +50,7 @@ command.  The accepted keywords depend on the selected style.
      - ``padding``, ``pad_verbose``, ``pair_forces``,
        ``max_number_of_reduction``, ``reduce_padding``,
        ``debug_no_energy_only_calc``, ``kappa``, ``bias_virial``,
-       ``kappa_norm``, ``kappa_group``
+       ``kappa_norm``, ``kappa_group``, ``q``
      - TensorFlow saved-model evaluator; uncertainty quantification (UQ)
        activates automatically when the model exports a UQ head
    * - ``grace/1layer/chunk``
@@ -97,6 +97,10 @@ The ``grace`` style additionally accepts:
 * ``pair_forces`` = compute pairwise forces.  This is required for virials
   and stress with ``grace`` and is enabled automatically when running on more
   than one MPI rank.
+* ``q`` value = total charge of the system in electrons, for a
+  charge-conditioned (FiLM) model.  Negative means excess electrons, matching
+  the convention of the electronic-structure codes such models are trained
+  against.  See :ref:`charge conditioning <grace_charge>` below.
 
 The chunked TensorFlow styles additionally accept:
 
@@ -768,6 +772,60 @@ The energy-only mode is selected automatically when LAMMPS requests only the
 potential energy from the pair style.  This is commonly used by Monte Carlo
 algorithms implemented in the MC package.
 
+.. _grace_charge:
+
+Charge-conditioned models
+"""""""""""""""""""""""""
+
+A charge-conditioned (FiLM) GRACE model takes the total charge of the system as
+an extra input and exports the work function :math:`\partial E/\partial q`
+alongside energy and forces.  Both are optional and are detected from the saved
+model's signature, so an ordinary GRACE model is driven exactly as before.
+
+Set the charge with the ``q`` keyword of the ``grace`` style:
+
+.. code-block:: LAMMPS
+
+   pair_style  grace q -0.5
+   pair_coeff  * * /path/to/saved_model O H Pt
+
+Supplying ``q`` to a model whose compute signature has no ``total_charge``
+input is an error rather than a warning: the charge would otherwise be ignored
+and every quantity computed afterwards would silently be the :math:`q = 0`
+result.
+
+The charge may also be changed during a run through
+``Pair::extract("total_charge")``, for example from a Python driver.
+
+**Reading the work function.**  :math:`\partial E/\partial q` is published as
+the pair style's global extra quantity, so :doc:`compute pair <compute_pair>`
+makes it an ordinary thermo value:
+
+.. code-block:: LAMMPS
+
+   compute       wf all pair grace
+   thermo_style  custom step temp pe c_wf[1]
+
+Anything that consumes a global scalar therefore works on it, including
+:doc:`fix ave/time <fix_ave_time>` and equal-style :doc:`variables <variable>`.
+It is also available through ``Pair::extract("work_function")``.
+
+Three properties of the reported value are worth knowing:
+
+* :doc:`compute pair <compute_pair>` sums the pair style's extra quantities
+  over MPI ranks, so the work function is contributed by rank 0 only.  A
+  per-rank contribution would report the work function multiplied by the number
+  of ranks.
+* It is ``NaN`` until a charge-conditioned model produces one, so reading it
+  from a model without a ``work_function`` output is unmistakable rather than a
+  plausible zero.
+* It is :math:`\partial E/\partial q` of the *padded* system.  Padded atoms
+  belong to the same structure, so the conditioning applies to them and they
+  contribute.  Unlike the padded energy this is not a constant offset, since
+  the contribution itself depends on the charge.  Use ``padding 0`` when the
+  absolute value must be exact; padding is otherwise a speed and recompilation
+  trade-off, not a correctness one.
+
 Mixing, shift, table, tail correction, restart, rRESPA info
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
@@ -847,7 +905,7 @@ Default
        disable; forces are always on under MPI with more than one rank),
        ``pad_verbose = off``, ``max_number_of_reduction = 10``,
        ``reduce_padding = 0.2``, ``kappa = 0``, ``kappa_norm = max``,
-       ``kappa_group = all``, ``bias_virial = off``
+       ``kappa_group = all``, ``bias_virial = off``, ``q = 0``
    * - ``grace/1layer/chunk`` and ``grace/2layer/chunk``
      - ``padding = 0.01``, ``chunksize = 4096``, ``pad_verbose = off``,
        ``max_number_of_reduction = 10``, ``reduce_padding = 0.2``
